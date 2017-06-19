@@ -1,0 +1,15 @@
+[package]
+name = "rocket-auth0-example"
+version = "0.1.0"
+authors = ["hyena <hyena@users.noreply.github.com>"]
+
+[dependencies]
+uuid = { version = "0.4", features = ["v4"] }
+
+[dependencies.rocket]
+git = "https://github.com/SergioBenitez/Rocket.git"
+rev = "b8ba7b8"
+
+[dependencies.rocket_codegen]
+git = "https://github.com/SergioBenitez/Rocket.git"
+rev = "b8ba7b8"
