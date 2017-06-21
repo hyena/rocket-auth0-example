@@ -22,30 +22,78 @@
 //!      time someone else might use this code, Rocket 0.3 may be
 //!      released and should include this functionality.
 
-#![feature(plugin)]
+#![feature(plugin, custom_derive)]
 #![plugin(rocket_codegen)]
 
+extern crate hyper;
+extern crate hyper_native_tls;
 extern crate rocket;
+extern crate rocket_contrib;
+extern crate serde;
+#[macro_use]
+extern crate serde_derive;
+extern crate serde_json;
 extern crate uuid;
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::RwLock;
+use std::time::Duration;
 
+use hyper::client::{Client, Response};
+use hyper::header::ContentType;
+use hyper::net::HttpsConnector;
+use hyper_native_tls::NativeTlsClient;
 use rocket::Outcome;
 use rocket::State;
-use rocket::config::{Config, Environment};
+use rocket::config::{self, ConfigError};
+use rocket::fairing::AdHoc;
 use rocket::http::{Cookie, Cookies};
 use rocket::response::{Redirect, Flash};
 use rocket::request::{self, Form, FlashMessage, FromRequest, Request};
+use rocket_contrib::Template;
 use uuid::Uuid;
-
 
 /// Maps session keys to email addresses.
 #[derive(Debug)]
 struct SessionMap(RwLock<HashMap<String, String>>);
 
+/// For the state of the application, including the client secrets.
+struct AppSettings {
+    client_id: String,
+    client_secret: String,
+    redirect_uri: String,
+    auth0_domain: String,
+}
+
 #[derive(Debug)]
 struct Email(String);
+
+/// Represents the access_code query string auth0 sends in a callback.
+#[derive(FromForm)]
+struct Code {
+    code: String,
+}
+
+// {"grant_type":"authorization_code","client_id": "YOUR_CLIENT_ID","client_secret": "YOUR_CLIENT_SECRET","code": "YOUR_AUTHORIZATION_CODE","redirect_uri": "https://YOUR_APP/callback"}'
+/// Represents a request for token_id retrieval.
+#[derive(Debug, Serialize)]
+struct TokenRequest<'r> {
+    grant_type: &'r str,
+    client_id: &'r str,
+    client_secret: &'r str,
+    code: &'r str,
+    redirect_uri: &'r str,
+}
+
+/// Represents a reponse from token_id retrieval.
+#[derive(Debug, Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    expires_in: u32,
+    id_token: String,
+    token_type: String,
+}
 
 impl<'a, 'r> FromRequest<'a, 'r> for Email {
     type Error = ();
@@ -70,9 +118,35 @@ impl<'a, 'r> FromRequest<'a, 'r> for Email {
         }
     }
 }
-        
+
 fn random_session_id() -> String {
     Uuid::new_v4().simple().to_string()
+}
+
+#[get("/login?<code>")]
+fn login_code(code: Code,
+              hyper_client: State<Client>,
+              settings: State<AppSettings>) -> String {
+    // There may be a better way to post this.
+    let data = TokenRequest {
+        grant_type: "authorization_code",
+        client_id: &settings.client_id,
+        client_secret: &settings.client_secret,
+        code: &code.code,
+        redirect_uri: &settings.redirect_uri,
+    };
+    println!("Body: {}", serde_json::to_string(&data).unwrap());
+    match hyper_client.post(&format!("https://{}/oauth/token", settings.auth0_domain))
+        .body(&serde_json::to_string(&data).unwrap())
+        .header(ContentType::json())
+        .send() {
+            Ok(mut res) => {
+                let mut buffer = String::new();
+                res.read_to_string(&mut buffer).unwrap();
+                format!("{}: {}", res.status, buffer)
+            },
+            Err(e) => format!("Error! {}", e)
+        }
 }
 
 #[get("/")]
@@ -83,27 +157,40 @@ fn email_index(email: Email) -> String {
 /// Called when a user doesn't have a valid cookie for session id.
 /// Generates a new session id, stores it, and gives it to them.
 #[get("/", rank = 2)]
-fn index(mut cookies: Cookies, session_map: State<SessionMap>) -> &'static str {
-    let new_session_id = random_session_id();
-    {  // Minimize length of the write lifetime.
-        let mut session_map = session_map.0.write().unwrap();
-        session_map.insert(new_session_id.clone(), String::from("hyena@github.com"));
-    }
-    cookies.add_private(Cookie::new("session", new_session_id));
+fn index(settings: State<AppSettings>) -> Template {
+    let mut context = HashMap::new();
+    context.insert("client_id", &settings.client_id);
+    context.insert("domain", &settings.auth0_domain);
+    context.insert("callback", &settings.redirect_uri);
 
-    "Inserted cookie. Reload the page."
+    Template::render("login", &context)
 }
 
 
 fn main() {
     let sessions = SessionMap(RwLock::new(HashMap::new()));
-    // In a real application be sure to generate and securely protect a real session key.
-    let secret_key = "itlYmFR2vYKrOmFhupMIn/hyB6lYCCTXz4yaQX89XVg=";
-    let config = Config::build(Environment::Development)
-        .secret_key(secret_key)
-        .unwrap();
-    rocket::custom(config, true)
-        .mount("/", routes![email_index, index])
+    let ssl = NativeTlsClient::new().unwrap();
+    let connector = HttpsConnector::new(ssl);
+    let mut hyper_client = Client::with_connector(connector);
+    hyper_client.set_read_timeout(Some(Duration::from_secs(60)));
+
+    rocket::ignite()
+        .attach(Template::fairing())
+        .mount("/", routes![email_index, index, login_code])
         .manage(sessions)
+        .manage(hyper_client)
+        .attach(AdHoc::on_attach(|rocket| {
+            println!("Adding managed state for config...");
+            let app_settings = AppSettings {
+                client_id: String::from(rocket.config().get_str("client_id").unwrap()),
+                client_secret: String::from(rocket.config().get_str("client_secret")
+                                            .unwrap()),
+                redirect_uri: String::from(rocket.config().get_str("redirect_uri")
+                                           .unwrap()),
+                auth0_domain: String::from(rocket.config().get_str("auth0_domain")
+                                           .unwrap()),
+            };
+            Ok(rocket.manage(app_settings))
+        }))
         .launch();
 }
