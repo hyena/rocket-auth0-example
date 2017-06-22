@@ -1,0 +1,51 @@
+<html>
+    <head>
+        <meta charset=utf-8>
+        <script src="https://cdn.auth0.com/js/lock/10.16/lock.min.js"></script>
+        <style>
+            @import url("https://overpass-30e2.kxcdn.com/overpass.css");
+            body {
+                background-color: black;
+                background: linear-gradient(#000014, #77BEEA);
+                font-family: 'Overpass',sans-serif;
+                height:100%;
+                padding: 20px;
+                color: #abb2bf;
+            }
+            h1 {
+                text-align:center;
+                font-size: 32px;
+            }
+            div .auth0-lock.auth0-lock .auth0-lock-center {
+                vertical-align: top;
+            }
+        </style>
+        <title>Sign-In</title>
+    </head>
+    <body>
+        <h1>Rocket🚀 Auth0 Demo</h1>
+        <h1>You are not presently logged in.</h1>
+        <div id="root">
+          embedded area
+        </div>
+        <script>
+            var lock = new Auth0Lock('{{ client_id }}', '{{ domain }}', {
+                allowedConnections: ["Username-Password-Authentication","google-oauth2","twitter","facebook"],
+                rememberLastLogin: false,
+                socialButtonStyle: "big",
+                languageDictionary: {"title":"Rocket Auth0 Demo"},
+                language: "en",
+                theme: {"logo":"https://rodent.io/images/young_hyena.svg","primaryColor":"#26269C"},
+                container: 'root',
+                auth: {
+                    redirectUrl: '{{ callback }}',
+                    responseType: 'code',
+                    params: {
+                        scope: 'openid email'
+                    }
+                }
+            });
+            lock.show();
+        </script>
+    </body>
+</html>
