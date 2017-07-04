@@ -27,9 +27,11 @@
 
 extern crate hyper;
 extern crate hyper_native_tls;
+extern crate jsonwebtoken as jwt;
+#[macro_use]
+extern crate log;
 extern crate rocket;
 extern crate rocket_contrib;
-extern crate serde;
 #[macro_use]
 extern crate serde_derive;
 extern crate serde_json;
@@ -44,11 +46,12 @@ use hyper::client::{Client, Response};
 use hyper::header::ContentType;
 use hyper::net::HttpsConnector;
 use hyper_native_tls::NativeTlsClient;
+use jwt::{encode, decode, Header, Algorithm, Validation};
 use rocket::Outcome;
 use rocket::State;
 use rocket::config::{self, ConfigError};
 use rocket::fairing::AdHoc;
-use rocket::http::{Cookie, Cookies};
+use rocket::http::{Cookie, Cookies, Status};
 use rocket::response::{Redirect, Flash};
 use rocket::request::{self, Form, FlashMessage, FromRequest, Request};
 use rocket_contrib::Template;
@@ -75,7 +78,6 @@ struct Code {
     code: String,
 }
 
-// {"grant_type":"authorization_code","client_id": "YOUR_CLIENT_ID","client_secret": "YOUR_CLIENT_SECRET","code": "YOUR_AUTHORIZATION_CODE","redirect_uri": "https://YOUR_APP/callback"}'
 /// Represents a request for token_id retrieval.
 #[derive(Debug, Serialize)]
 struct TokenRequest<'r> {
@@ -95,6 +97,12 @@ struct TokenResponse {
     token_type: String,
 }
 
+/// Represents the structure of the token. There's only one field we care about.
+#[derive(Debug, Deserialize)]
+struct Token {
+    email: String,
+}
+
 impl<'a, 'r> FromRequest<'a, 'r> for Email {
     type Error = ();
 
@@ -109,7 +117,7 @@ impl<'a, 'r> FromRequest<'a, 'r> for Email {
                 let session_map_state = State::<SessionMap>::from_request(request)
                     .unwrap();
                 let session_map = session_map_state.0.read().unwrap();
-                
+
                 match session_map.get(&session_id) {
                     Some(email) => Outcome::Success(Email(email.clone())),
                     None => Outcome::Forward(())
@@ -126,7 +134,7 @@ fn random_session_id() -> String {
 #[get("/login?<code>")]
 fn login_code(code: Code,
               hyper_client: State<Client>,
-              settings: State<AppSettings>) -> String {
+              settings: State<AppSettings>) -> Result<String, Status> {
     // There may be a better way to post this.
     let data = TokenRequest {
         grant_type: "authorization_code",
@@ -135,18 +143,33 @@ fn login_code(code: Code,
         code: &code.code,
         redirect_uri: &settings.redirect_uri,
     };
-    println!("Body: {}", serde_json::to_string(&data).unwrap());
-    match hyper_client.post(&format!("https://{}/oauth/token", settings.auth0_domain))
-        .body(&serde_json::to_string(&data).unwrap())
-        .header(ContentType::json())
-        .send() {
-            Ok(mut res) => {
-                let mut buffer = String::new();
-                res.read_to_string(&mut buffer).unwrap();
-                format!("{}: {}", res.status, buffer)
-            },
-            Err(e) => format!("Error! {}", e)
+
+    // Now that we have a request, attempt to retrieve the token and decode.
+    // This is a multi-step process with lots of opportunity for failure so
+    // we wrap it in a closure and use `?`.
+    let retrieve_id = || {
+        let body: String = serde_json::to_string(&data).or(Err("json decode"))?;
+        let mut res = hyper_client.post(&format!("https://{}/oauth/token", settings.auth0_domain))
+            .body(&body)
+            .header(ContentType::json())
+            .send()
+            .or(Err("sending"))?;
+        if !(res.status == hyper::Ok) {
+             return Err("bad response");
         }
+        let mut buffer = String::new();
+        res.read_to_string(&mut buffer).or(Err("reading buffer"))?;
+        let token_response = serde_json::from_str::<TokenResponse>(&buffer)
+                             .or(Err("json format"))?;
+        // Todo: Use a better library for this.
+        let token = decode::<Token>(&token_response.id_token,
+                                     // Auth0 uses the client secret to sign its tokens.
+                                     &settings.client_secret.as_bytes(),
+                                     &Validation::default()).or(Err("decoding token"))?;
+        Ok(token.claims.email)
+    };
+    // Todo: Log the error message.
+    retrieve_id().or(Err(Status::BadGateway))
 }
 
 #[get("/")]
